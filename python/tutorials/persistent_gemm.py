@@ -66,7 +66,6 @@ def matmul_kernel_persistent(
     a_ptr,
     b_ptr,
     c_ptr,
-    d_ptr,
     M,
     N,
     K,
@@ -76,8 +75,6 @@ def matmul_kernel_persistent(
     stride_bn,
     stride_cm,
     stride_cn,
-    stride_dm,
-    stride_dn,
     alpha,
     beta,
     BLOCK_SIZE_M: tl.constexpr,
@@ -144,18 +141,16 @@ def matmul_kernel_persistent(
         else:
             c = accumulator.to(tl.float16)
 
-        # c = alpha * c + beta * tl.load(d_ptrs, mask=d_mask)
-        if beta != 0.0:
-            d_ptrs = d_ptr + stride_dm * offs_cm[:, None] + stride_dn * offs_cn[None, :]
-            d_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-            c = (alpha * c + beta * tl.load(d_ptrs, mask=d_mask)).to(c.dtype)
-        else:
-            c = (alpha * c).to(c.dtype)
+        c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
+        # if beta != 0.0:
+        #     c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
+        # else:
+        #     c = (alpha * c).to(c.dtype)
 
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul_persistent(a, b, alpha=1.0, beta=0.0, d=None):
+def matmul_persistent(a, b, c = None, alpha=1.0, beta=0.0):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -164,7 +159,7 @@ def matmul_persistent(a, b, alpha=1.0, beta=0.0, d=None):
     K, N = b.shape
     dtype = a.dtype
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    c = torch.empty((M, N), device=a.device, dtype=dtype) if c is None else c
     # 1D launch kernel where each block gets its own program.
     grid = lambda META: (
         min(
@@ -173,14 +168,10 @@ def matmul_persistent(a, b, alpha=1.0, beta=0.0, d=None):
         ),
     )
 
-    if d is None:
-        d = torch.zeros_like(c)
-
     matmul_kernel_persistent[grid](
         a,
         b,
         c,
-        d,
         M,
         N,
         K,
@@ -190,8 +181,6 @@ def matmul_persistent(a, b, alpha=1.0, beta=0.0, d=None):
         b.stride(1),
         c.stride(0),
         c.stride(1),
-        d.stride(0),
-        d.stride(1),
         alpha=alpha,
         beta=beta,
         NUM_SMS=NUM_SMS,
@@ -212,61 +201,55 @@ def torch_matmul(a, b):
     return c
 
 
-def torch_gemm(a, b, alpha=1.0, beta=0.0, d=None):
+def torch_gemm(a, b, c, alpha=1.0, beta=0.0):
     # Perform matrix multiplication
-    c = torch.matmul(a, b.T)
+    x = torch.matmul(a, b.T)
     # Scale the result by alpha
-    c = alpha * c
-    # If d is provided, scale it by beta and add to c
-    if d is not None:
-        c += beta * d
+    c = beta * c + alpha * x
     return c
 
 
-def validate(M, N, K, alpha, beta, d: Optional[torch.Tensor] = None, dtype: torch.dtype = torch.float16):
-    a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
+def validate(M, N, K, alpha, beta, dtype: torch.dtype = torch.float16):
+    a = torch.randn((M, K), device="cuda", dtype=dtype)
+    b = torch.randn((K, N), device="cuda", dtype=dtype)
     b = b.T.contiguous()
 
-    # torch_result_matmul = torch_matmul(a, b) if dtype == torch.float16 else None
-    # persistent_result_matmul = matmul_persistent(a, b.T, alpha=alpha, beta=beta)
+    if beta == 0.0:
+        torch_result_matmul = torch_matmul(a, b)
+        persistent_result_matmul = matmul_persistent(a, b.T, alpha=alpha, beta=beta)
 
-    # if torch_result_matmul is not None:
-    #     persistent_vs_torch_matmul = (
-    #         "✅"
-    #         if torch.allclose(
-    #             persistent_result_matmul.to(torch.float16),
-    #             torch_result_matmul.to(torch.float16),
-    #             atol=1.0,
-    #         )
-    #         else "❌"
-    #     )
-    # print(f"persistent_vs_torch_matmul: {persistent_vs_torch_matmul}")
-
-    torch_result_gemm = torch_gemm(a, b, alpha=alpha, beta=beta, d=d)
-    persistent_result_gemm = matmul_persistent(a, b.T, alpha=alpha, beta=beta, d=d)
-
-    if torch_result_gemm is not None:
-        persistent_vs_torch_gemm = (
-            "✅"
-            if torch.allclose(
-                persistent_result_gemm.to(torch.float16),
-                torch_result_gemm.to(torch.float16),
-                atol=1.0,
+        if torch_result_matmul is not None:
+            persistent_vs_torch_matmul = (
+                "✅"
+                if torch.allclose(
+                    persistent_result_matmul.to(torch.float16),
+                    torch_result_matmul.to(torch.float16),
+                    atol=1.0,
+                )
+                else "❌"
             )
-            else "❌"
-        )
-    print(f"persistent_vs_torch_gemm: {persistent_vs_torch_gemm}")
+        print(f"persistent_vs_torch_matmul: {persistent_vs_torch_matmul}")
+    else:
+        c = torch.randn((M, N), device="cuda", dtype=dtype)
+        torch_result_gemm = torch_gemm(a, b, c, alpha=alpha, beta=beta)
+        persistent_result_gemm = matmul_persistent(a, b.T, c = c, alpha=alpha, beta=beta)
+
+        if torch_result_gemm is not None:
+            persistent_vs_torch_gemm = (
+                "✅"
+                if torch.allclose(
+                    persistent_result_gemm.to(torch.float16),
+                    torch_result_gemm.to(torch.float16),
+                    atol=1.0,
+                )
+                else "❌"
+            )
+        print(f"persistent_vs_torch_gemm: {persistent_vs_torch_gemm}")
 
 
 if __name__ == "__main__":
     validate(1024, 1024, 1024, 1.0, 0.0, dtype=torch.float16)
     validate(1024, 1024, 1024, 1.0, 0.0, dtype=torch.float32)
-
-    # random d
-    d = torch.randn((1024, 1024), device="cuda", dtype=torch.float16)
-    validate(1024, 1024, 1024, 1.0, 0.0, d=d, dtype=torch.float16)
-    validate(1024, 1024, 1024, 1.0, 0.0, d=d, dtype=torch.float32)
 
     # alpha and beta
     alpha = 2.0
