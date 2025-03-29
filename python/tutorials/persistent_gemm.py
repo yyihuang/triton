@@ -287,17 +287,17 @@ def validate(M, N, K, alpha, beta, dtype: torch.dtype = torch.float16):
 
 if __name__ == "__main__":
     print("Testing float16, beta = 0.0")
-    validate(1024, 1024, 1024, 1.0, 0.0, dtype=torch.float16)
+    validate(1024, 512, 1024, 1.0, 0.0, dtype=torch.float16)
     print("Testing float32, beta = 0.0")
-    validate(1024, 1024, 1024, 1.0, 0.0, dtype=torch.float32)
+    validate(1024, 512, 1024, 1.0, 0.0, dtype=torch.float32)
 
     # alpha and beta
     alpha = 2.0
     beta = 3.0
     print("Testing float16, alpha = 2.0, beta = 3.0")
-    validate(1024, 1024, 1024, alpha, beta, dtype=torch.float16)
+    validate(1024, 512, 1024, alpha, beta, dtype=torch.float16)
     print("Testing float32, alpha = 2.0, beta = 3.0")
-    validate(1024, 1024, 1024, alpha, beta, dtype=torch.float32)
+    validate(1024, 512, 1024, alpha, beta, dtype=torch.float32)
 
 '''
 (triton-nightly) yingyi@ptc:~/workspace/triton$ python3 /home/yingyi/workspace/triton/python/tutorials/persistent_gemm.py
