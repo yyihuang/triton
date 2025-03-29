@@ -9,18 +9,30 @@ from contextlib import contextmanager
 
 from typing import Optional
 
-NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count // 2 # test 50% of the sms
+NUM_SMS = (
+    torch.cuda.get_device_properties("cuda").multi_processor_count // 2
+)  # test 50% of the sms
 
 
 def matmul_get_configs():
     return [
-        triton.Config({'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K" : BK, "GROUP_SIZE_M" : 8}, num_stages=s, num_warps=w) \
-        for BM in [128] \
-        for BN in [128, 256] \
-        for BK in [64,128] \
-        for s in ([3,4]) \
-        for w in [4,8] \
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": BM,
+                "BLOCK_SIZE_N": BN,
+                "BLOCK_SIZE_K": BK,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=s,
+            num_warps=w,
+        )
+        for BM in [128]
+        for BN in [128, 256]
+        for BK in [64, 128]
+        for s in ([3, 4])
+        for w in [4, 8]
     ]
+
 
 def _matmul_launch_metadata(grid, kernel, args):
     ret = {}
@@ -30,9 +42,10 @@ def _matmul_launch_metadata(grid, kernel, args):
         bytes_per_elem = args["c_ptr"].element_size()
     else:
         bytes_per_elem = 1 if args["FP8_OUTPUT"] else 2
-    ret[f"flops{bytes_per_elem * 8}"] = 2. * M * N * K
+    ret[f"flops{bytes_per_elem * 8}"] = 2.0 * M * N * K
     ret["bytes"] = bytes_per_elem * (M * K + N * K + M * N)
     return ret
+
 
 @triton.jit
 def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
@@ -43,23 +56,36 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
     pid_n = (tile_id % num_pid_in_group) // group_size_m
     return pid_m, pid_n
 
+
 @triton.autotune(
     configs=matmul_get_configs(),
     key=["M", "N", "K"],
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
-                             M, N, K,
-                             stride_am, stride_ak,
-                             stride_bk, stride_bn,
-                             stride_cm, stride_cn,
-                             alpha, beta,
-                             BLOCK_SIZE_M: tl.constexpr,
-                             BLOCK_SIZE_N: tl.constexpr,
-                             BLOCK_SIZE_K: tl.constexpr,
-                             GROUP_SIZE_M: tl.constexpr,
-                             NUM_SMS: tl.constexpr,
-                             ):
+def matmul_kernel_persistent(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    d_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_dm,
+    stride_dn,
+    alpha,
+    beta,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -73,9 +99,11 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
     offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    # 
+    #
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        pid_m, pid_n = _compute_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
         offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
@@ -88,27 +116,46 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-            b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+            a_ptrs = a_ptr + (
+                offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            )
 
-            a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
+            a = tl.load(
+                a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0
+            )
+            b = tl.load(
+                b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
+            )
             accumulator = tl.dot(a, b, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        pid_m, pid_n = _compute_pid(
+            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        if (c_ptr.dtype.element_ty == tl.float8e4nv):
+        if c_ptr.dtype.element_ty == tl.float8e4nv:
             c = accumulator.to(tl.float8e4nv)
         else:
             c = accumulator.to(tl.float16)
-        c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
+
+        # c = alpha * c + beta * tl.load(d_ptrs, mask=d_mask)
+        if beta != 0.0:
+            d_ptrs = d_ptr + stride_dm * offs_cm[:, None] + stride_dn * offs_cn[None, :]
+            d_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            c = (alpha * c + beta * tl.load(d_ptrs, mask=d_mask)).to(c.dtype)
+        else:
+            c = (alpha * c).to(c.dtype)
+
         tl.store(c_ptrs, c, mask=c_mask)
 
-def matmul_persistent(a, b, alpha=1.0, beta=0.0):
+
+def matmul_persistent(a, b, alpha=1.0, beta=0.0, d=None):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -119,46 +166,110 @@ def matmul_persistent(a, b, alpha=1.0, beta=0.0):
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=dtype)
     # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])), )
+    grid = lambda META: (
+        min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ),
+    )
+
+    if d is None:
+        d = torch.zeros_like(c)
+
     matmul_kernel_persistent[grid](
-        a, b, c,  #
-        M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        alpha, beta,
+        a,
+        b,
+        c,
+        d,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        d.stride(0),
+        d.stride(1),
+        alpha=alpha,
+        beta=beta,
         NUM_SMS=NUM_SMS,
     )
     return c
+
 
 def torch_matmul(a, b):
     M, K = a.shape
     N, K = b.shape
     bytes_per_elem = a.element_size()
     flops_str = f"flops{bytes_per_elem * 8}"
-    with proton.scope(f"torch [M={M}, N={N}, K={K}]",
-                      {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
+    with proton.scope(
+        f"torch [M={M}, N={N}, K={K}]",
+        {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2.0 * M * N * K},
+    ):
         c = torch.matmul(a, b.T)
     return c
 
 
-def validate(M, N, K, dtype):
+def torch_gemm(a, b, alpha=1.0, beta=0.0, d=None):
+    # Perform matrix multiplication
+    c = torch.matmul(a, b.T)
+    # Scale the result by alpha
+    c = alpha * c
+    # If d is provided, scale it by beta and add to c
+    if d is not None:
+        c += beta * d
+    return c
+
+
+def validate(M, N, K, alpha, beta, d: Optional[torch.Tensor] = None, dtype: torch.dtype = torch.float16):
     a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
     b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
     b = b.T.contiguous()
 
-    torch_result = torch_matmul(a, b) if dtype == torch.float16 else None
-    # cublas_result = cublas_matmul(a, b) if cublas is not None else None
-    # naive_result = matmul(a, b.T)
-    persistent_result = matmul_persistent(a, b.T)
-    # tma_persistent_result = matmul_tma_persistent(a, b) if supports_tma() else None
-    # descriptor_persistent_result = matmul_descriptor_persistent(a, b) if supports_tma() else None
+    # torch_result_matmul = torch_matmul(a, b) if dtype == torch.float16 else None
+    # persistent_result_matmul = matmul_persistent(a, b.T, alpha=alpha, beta=beta)
 
-    if torch_result is not None:
-        persistent_vs_torch = "✅" if torch.allclose(persistent_result.to(torch.float16), torch_result.to(torch.float16),
-                                               atol=1.0) else "❌"
-    print()
+    # if torch_result_matmul is not None:
+    #     persistent_vs_torch_matmul = (
+    #         "✅"
+    #         if torch.allclose(
+    #             persistent_result_matmul.to(torch.float16),
+    #             torch_result_matmul.to(torch.float16),
+    #             atol=1.0,
+    #         )
+    #         else "❌"
+    #     )
+    # print(f"persistent_vs_torch_matmul: {persistent_vs_torch_matmul}")
+
+    torch_result_gemm = torch_gemm(a, b, alpha=alpha, beta=beta, d=d)
+    persistent_result_gemm = matmul_persistent(a, b.T, alpha=alpha, beta=beta, d=d)
+
+    if torch_result_gemm is not None:
+        persistent_vs_torch_gemm = (
+            "✅"
+            if torch.allclose(
+                persistent_result_gemm.to(torch.float16),
+                torch_result_gemm.to(torch.float16),
+                atol=1.0,
+            )
+            else "❌"
+        )
+    print(f"persistent_vs_torch_gemm: {persistent_vs_torch_gemm}")
+
 
 if __name__ == "__main__":
-    validate(1024, 1024, 1024, torch.float16)
+    validate(1024, 1024, 1024, 1.0, 0.0, dtype=torch.float16)
+    validate(1024, 1024, 1024, 1.0, 0.0, dtype=torch.float32)
 
+    # random d
+    d = torch.randn((1024, 1024), device="cuda", dtype=torch.float16)
+    validate(1024, 1024, 1024, 1.0, 0.0, d=d, dtype=torch.float16)
+    validate(1024, 1024, 1024, 1.0, 0.0, d=d, dtype=torch.float32)
+
+    # alpha and beta
+    alpha = 2.0
+    beta = 3.0
+    validate(1024, 1024, 1024, alpha, beta, dtype=torch.float16)
+    validate(1024, 1024, 1024, alpha, beta, dtype=torch.float32)
