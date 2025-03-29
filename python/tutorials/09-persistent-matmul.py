@@ -237,7 +237,7 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
-                             M, N, K,  #
+                             M, N, K, 
                              stride_am, stride_ak,  #
                              stride_bk, stride_bn,  #
                              stride_cm, stride_cn,  #
@@ -247,7 +247,7 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
                              GROUP_SIZE_M: tl.constexpr,  #
                              NUM_SMS: tl.constexpr,  #
                              ):
-    start_pid = tl.program_id(axis=0)
+    start_pid = tl.program_id(axis=0) # total #SM
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)

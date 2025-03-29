@@ -264,14 +264,29 @@ def matmul_kernel(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     # See above `L2 Cache Optimizations` section for details.
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid = tl.program_id(axis=0) # global program id, each program handles a BLOCK_SIZE_M x BLOCK_SIZE_N block of C
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M) # number of program ids along the M axis
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N) # number of program ids along the N axis
+    # group at only m dimension
+    # so each group contains GROUP_SIZE_M * num_pid_n program ids
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    # id of the group this program is in
     group_id = pid // num_pid_in_group
+    # row-id of the first program in the group
     first_pid_m = group_id * GROUP_SIZE_M
+    # if `num_pid_m` isn't divisible by `GROUP_SIZE_M`, the last group is smaller
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    # *Within groups*, programs are ordered in a column-major order
+    # row-id of the program in the *launch grid*
+    #
+    # pid % num_pid_in_group: local program id within the group
+    # local_program_id % group_size_m: row-id of the program in the group [0, group_size_m)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+
+    # col-id of the program in the *launch grid*
+    # 
+    # pid % num_pid_in_group: local program id within the group
+    # local_program_id // group_size_m: col-id of the program in the group [0, num_pid_n)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # ----------------------------------------------------------
