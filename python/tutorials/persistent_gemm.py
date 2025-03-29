@@ -142,15 +142,11 @@ def matmul_kernel_persistent(
             c = accumulator.to(tl.float16)
 
         c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
-        # if beta != 0.0:
-        #     c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
-        # else:
-        #     c = (alpha * c).to(c.dtype)
 
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul_persistent(a, b, c = None, alpha=1.0, beta=0.0):
+def matmul_persistent(a, b, c=None, alpha=1.0, beta=0.0):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -205,8 +201,14 @@ def torch_gemm(a, b, c, alpha=1.0, beta=0.0):
     # Perform matrix multiplication
     x = torch.matmul(a, b.T)
     # Scale the result by alpha
-    c = beta * c + alpha * x
+    c = alpha * x + beta * c
     return c
+
+
+def torch_addmm(a, b, c, alpha=1.0, beta=0.0):
+    # Transpose b to match torch_gemm's matmul(a, b.T)
+    C = torch.addmm(c, a, b.T, beta=beta, alpha=alpha)
+    return C
 
 
 def validate(M, N, K, alpha, beta, dtype: torch.dtype = torch.float16):
@@ -230,9 +232,30 @@ def validate(M, N, K, alpha, beta, dtype: torch.dtype = torch.float16):
             )
         print(f"persistent_vs_torch_matmul: {persistent_vs_torch_matmul}")
     else:
-        c = torch.randn((M, N), device="cuda", dtype=dtype)
-        torch_result_gemm = torch_gemm(a, b, c, alpha=alpha, beta=beta)
-        persistent_result_gemm = matmul_persistent(a, b.T, c = c, alpha=alpha, beta=beta)
+        c0 = torch.randn((M, N), device="cuda", dtype=dtype)
+        c1 = c0.clone()
+        c2 = c0.clone()
+        
+        torch_result_gemm = torch_gemm(a, b, c0, alpha=alpha, beta=beta)
+        # check if c0 is modified to torch_result_gemm
+        if torch.allclose(c0, torch_result_gemm, atol=1.0):
+            print("c0 is modified to torch_result_gemm")
+        else:
+            print("c0 is not modified to torch_result_gemm")
+
+        persistent_result_gemm = matmul_persistent(a, b.T, c=c1, alpha=alpha, beta=beta)
+        # check if c1 is modified to persistent_result_gemm
+        if torch.allclose(c1, persistent_result_gemm, atol=1.0):
+            print("c1 is modified to persistent_result_gemm")
+        else:
+            print("c1 is not modified to persistent_result_gemm")
+
+        torch_result_addmm = torch_addmm(a, b, c2, alpha=alpha, beta=beta)
+        # check if c2 is modified to torch_result_addmm
+        if torch.allclose(c2, torch_result_addmm, atol=1.0):
+            print("c2 is modified to torch_result_addmm")
+        else:
+            print("c2 is not modified to torch_result_addmm")
 
         if torch_result_gemm is not None:
             persistent_vs_torch_gemm = (
@@ -246,13 +269,51 @@ def validate(M, N, K, alpha, beta, dtype: torch.dtype = torch.float16):
             )
         print(f"persistent_vs_torch_gemm: {persistent_vs_torch_gemm}")
 
+        if torch_result_addmm is not None:
+            torch_gemm_vs_torch_addmm = (
+                "✅"
+                if torch.allclose(
+                    torch_result_gemm.to(torch.float16),
+                    torch_result_addmm.to(torch.float16),
+                    atol=1.0,
+                )
+                else "❌"
+            )
+            if torch_gemm_vs_torch_addmm == "❌":
+                print(f"torch_gemm: {torch_result_gemm}")
+                print(f"torch_addmm: {torch_result_addmm}")
+        print(f"torch_gemm_vs_torch_addmm: {torch_gemm_vs_torch_addmm}")
+
 
 if __name__ == "__main__":
+    print("Testing float16, beta = 0.0")
     validate(1024, 1024, 1024, 1.0, 0.0, dtype=torch.float16)
+    print("Testing float32, beta = 0.0")
     validate(1024, 1024, 1024, 1.0, 0.0, dtype=torch.float32)
 
     # alpha and beta
     alpha = 2.0
     beta = 3.0
+    print("Testing float16, alpha = 2.0, beta = 3.0")
     validate(1024, 1024, 1024, alpha, beta, dtype=torch.float16)
+    print("Testing float32, alpha = 2.0, beta = 3.0")
     validate(1024, 1024, 1024, alpha, beta, dtype=torch.float32)
+
+'''
+(triton-nightly) yingyi@ptc:~/workspace/triton$ python3 /home/yingyi/workspace/triton/python/tutorials/persistent_gemm.py
+Testing float16, beta = 0.0
+persistent_vs_torch_matmul: ✅
+Testing float32, beta = 0.0
+persistent_vs_torch_matmul: ✅
+Testing float16, alpha = 2.0, beta = 3.0
+c0 is not modified to torch_result_gemm
+c1 is modified to persistent_result_gemm
+c2 is not modified to torch_result_addmm
+persistent_vs_torch_gemm: ✅
+torch_gemm_vs_torch_addmm: ✅
+Testing float32, alpha = 2.0, beta = 3.0
+c0 is not modified to torch_result_gemm
+c1 is modified to persistent_result_gemm
+c2 is not modified to torch_result_addmm
+persistent_vs_torch_gemm: ✅
+'''
