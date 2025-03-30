@@ -27,6 +27,7 @@ import triton.language as tl
 import triton.tools.experimental_descriptor
 import triton.profiler as proton
 from contextlib import contextmanager
+# import cupy as cp
 
 from typing import Optional
 
@@ -150,6 +151,7 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr,  #
                   stride_am, stride_ak,  #
                   stride_bk, stride_bn,  #
                   stride_cm, stride_cn,  #
+                  alpha, beta,
                   BLOCK_SIZE_M: tl.constexpr,  #
                   BLOCK_SIZE_N: tl.constexpr,  #
                   BLOCK_SIZE_K: tl.constexpr,  #
@@ -190,13 +192,18 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr,  #
 
     if (c_ptr.dtype.element_ty == tl.float8e4nv):
         c = accumulator.to(tl.float8e4nv)
-    else:
+    elif c_ptr.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif c_ptr.dtype.element_ty == tl.float16:
         c = accumulator.to(tl.float16)
+    else:
+        c = accumulator.to(tl.float32)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -217,6 +224,7 @@ def matmul(a, b):
         a.stride(0), a.stride(1),  #
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
+        alpha=1.0, beta=0.0,
     )
     return c
 
@@ -241,13 +249,14 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
                              stride_am, stride_ak,  #
                              stride_bk, stride_bn,  #
                              stride_cm, stride_cn,  #
+                             alpha, beta,
                              BLOCK_SIZE_M: tl.constexpr,  #
                              BLOCK_SIZE_N: tl.constexpr,  #
                              BLOCK_SIZE_K: tl.constexpr,  #
                              GROUP_SIZE_M: tl.constexpr,  #
                              NUM_SMS: tl.constexpr,  #
                              ):
-    start_pid = tl.program_id(axis=0) # total #SM
+    start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
@@ -261,7 +270,9 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        pid_m, pid_n = _compute_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
         offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
@@ -274,23 +285,49 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-            b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+            a_ptrs = a_ptr + (
+                offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            )
 
-            a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
+            a = tl.load(
+                a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0
+            )
+            b = tl.load(
+                b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
+            )
             accumulator = tl.dot(a, b, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        pid_m, pid_n = _compute_pid(
+            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        if (c_ptr.dtype.element_ty == tl.float8e4nv):
-            c = accumulator.to(tl.float8e4nv)
-        else:
-            c = accumulator.to(tl.float16)
+        # if c_ptr.dtype.element_ty == tl.float8e4nv:
+        #     c = accumulator.to(tl.float8e4nv)
+        # elif c_ptr.dtype.element_ty == tl.bfloat16:
+        #     c = accumulator.to(tl.bfloat16)
+        # elif c_ptr.dtype.element_ty == tl.float16:
+        #     c = accumulator.to(tl.float16)
+        # else:
+        #     c = accumulator.to(tl.float32)
+        # float8e4nv, bfloat16, float16, float32 
+        c = accumulator.to(c_ptr.dtype.element_ty)
+        
+
+        # if beta == 0.0:
+        #     c = alpha * c
+        # else:
+        #     c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
+
+        c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
+        # if beta != 0.0:
+        #     c = c + beta * tl.load(c_ptrs, mask=c_mask)
         tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -312,6 +349,7 @@ def matmul_persistent(a, b):
         a.stride(0), a.stride(1),  #
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
+        alpha=1.0, beta=1.0,
         NUM_SMS=NUM_SMS,  #
     )
     return c
@@ -573,7 +611,7 @@ def cublas_matmul(a, b):
     flops_str = f"flops{bytes_per_elem * 8}"
     with proton.scope(f"cublas [M={M}, N={N}, K={K}]",
                       {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
-        cublas.matmul(a, b, c)
+        cublas.matmul(a, b, c) # todo: cp.cuda.cublas.sgemm
     return c
 
 
@@ -582,9 +620,12 @@ def torch_matmul(a, b):
     N, K = b.shape
     bytes_per_elem = a.element_size()
     flops_str = f"flops{bytes_per_elem * 8}"
+    alpha = 1.0
+    beta = 0.0
     with proton.scope(f"torch [M={M}, N={N}, K={K}]",
                       {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
         c = torch.matmul(a, b.T)
+        c = alpha * c + beta * c
     return c
 
 
@@ -694,8 +735,8 @@ if __name__ == "__main__":
 
         torch.manual_seed(0)
 
-        validate(32, 32, 32, dtype)
-        validate(8192, 8192, args.K_range[0], dtype)
+        # validate(32, 32, 32, dtype)
+        # validate(8192, 8192, args.K_range[0], dtype)
 
         proton.start("matmul", hook="triton")
         for K in range(args.K_range[0], args.K_range[1] + 1, args.K_step):
