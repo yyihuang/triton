@@ -308,26 +308,14 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        # if c_ptr.dtype.element_ty == tl.float8e4nv:
-        #     c = accumulator.to(tl.float8e4nv)
-        # elif c_ptr.dtype.element_ty == tl.bfloat16:
-        #     c = accumulator.to(tl.bfloat16)
-        # elif c_ptr.dtype.element_ty == tl.float16:
-        #     c = accumulator.to(tl.float16)
-        # else:
-        #     c = accumulator.to(tl.float32)
         # float8e4nv, bfloat16, float16, float32 
         c = accumulator.to(c_ptr.dtype.element_ty)
-        
-
+        c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
+        # c = tl.fma(c, alpha, beta * tl.load(c_ptrs, mask=c_mask))
         # if beta == 0.0:
         #     c = alpha * c
         # else:
         #     c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
-
-        c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
-        # if beta != 0.0:
-        #     c = c + beta * tl.load(c_ptrs, mask=c_mask)
         tl.store(c_ptrs, c, mask=c_mask)
 
 
