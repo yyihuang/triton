@@ -307,6 +307,12 @@ class base_type:
         """
         raise NotImplementedError
 
+    def mangle(self) -> str:
+        raise NotImplementedError(f"NYI: Type mangling for type {self.__class__}")
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        raise NotImplementedError
+
 
 # -----------------------
 # dtype
@@ -502,10 +508,6 @@ class dtype(base_type):
     def is_const():
         return False
 
-    @staticmethod
-    def is_tuple():
-        return False
-
     def __eq__(self, other: dtype):
         if not isinstance(other, dtype):
             return False
@@ -517,6 +519,9 @@ class dtype(base_type):
     @property
     def scalar(self):
         return self
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        out.append(self.to_ir(builder))
 
     def to_ir(self, builder: ir.builder) -> ir.type:
         if self.name.startswith("fp8"):
@@ -581,6 +586,17 @@ class dtype(base_type):
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[base_value, int]:
         return tensor(handles[cursor], self), cursor + 1
 
+    def mangle(self) -> str:
+        if self.is_int():
+            SIGNED = dtype.SIGNEDNESS.SIGNED
+            prefix = 'i' if self.int_signedness == SIGNED else 'u'
+            return prefix + str(self.int_bitwidth)
+        if self.is_floating():
+            return str(self)
+        if self.is_void():
+            return 'V'
+        return super().mangle()
+
 
 # Some functions have a param named `dtype`, which shadows the `dtype` class.
 # We can't change the param name because it is part of function's public API.
@@ -623,12 +639,8 @@ class pointer_type(dtype):
     def scalar(self):
         return self
 
-
-class nv_tma_desc_type(pointer_type):
-
-    def __init__(self, const=True, address_space=0):
-        super().__init__(uint8, const=const, address_space=address_space)
-        self.name = 'nv_tma_desc_type'
+    def mangle(self) -> str:
+        return f"P{self.element_ty.mangle()}"
 
 
 class block_type(dtype):
@@ -672,6 +684,11 @@ class block_type(dtype):
     def scalar(self):
         return self.element_ty
 
+    def mangle(self) -> str:
+        elt = self.scalar.mangle()
+        shape = '_'.join(map(str, self.shape))
+        return f'{elt}S{shape}S'
+
 
 class tuple_type(base_type):
 
@@ -686,14 +703,13 @@ class tuple_type(base_type):
     def __iter__(self):
         return iter(self.types)
 
-    def to_ir(self, builder: ir.builder):
-        return [ty.to_ir(builder) for ty in self.types]
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]):
+        for ty in self.types:
+            if not isinstance(ty, constexpr):
+                ty._flatten_ir_types(builder, out)
 
     def __getitem__(self, index: int) -> dtype:
         return self.types[index]
-
-    def is_tuple(self):
-        return True
 
     def __eq__(self, other):
         return type(self) is type(other) and self.types == other.types and self.fields == other.fields
@@ -704,6 +720,9 @@ class tuple_type(base_type):
             value, cursor = ty._unflatten_ir(handles, cursor)
             values.append(value)
         return tuple(values, self), cursor
+
+    def mangle(self):
+        return 'T' + '_'.join(ty.mangle for ty in self.types) + 'T'
 
 
 class slice_type(dtype):
@@ -1185,7 +1204,7 @@ class tuple(base_value):
         def get_type(x):
             if isinstance(x, dtype):
                 return dtype
-            if isinstance(x, int):
+            if isinstance(x, (int, float)):
                 return constexpr
             return x.type
 
@@ -1263,8 +1282,8 @@ class tensor_descriptor_base_type(base_type):
         value = tensor_descriptor_base(handles[cursor], self.block_type)
         return value, cursor + 1
 
-    def to_ir(self, builder: ir.builder):
-        return builder.create_tensor_descriptor_type(self.block_type.to_ir(builder))
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        out.append(builder.create_tensor_descriptor_type(self.block_type.to_ir(builder)))
 
     def __str__(self) -> str:
         # ex. "tensor_descriptor<float32[16, 32]>"
@@ -1277,6 +1296,9 @@ class tensor_descriptor_base_type(base_type):
 
     def __neq__(self, other) -> bool:
         return not (self == other)
+
+    def mangle(self) -> str:
+        return f"TD{self.block_type.mangle()}"
 
 
 class tensor_descriptor_base(base_value):
@@ -1363,8 +1385,10 @@ class tensor_descriptor_type(tensor_descriptor_base_type):
         value = tensor_descriptor(handle, shape, strides, self.block_type)
         return value, cursor
 
-    def to_ir(self, builder: ir.builder):
-        return [super().to_ir(builder), *self.shape_type.to_ir(builder), *self.strides_type.to_ir(builder)]
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        super()._flatten_ir_types(builder, out)
+        self.shape_type._flatten_ir_types(builder, out)
+        self.strides_type._flatten_ir_types(builder, out)
 
     def __eq__(self, other):
         return super().__eq__(other) and (self.shape_type == other.shape_type) and (self.strides_type
@@ -1543,7 +1567,7 @@ def trans(input: tensor, *dims, _builder=None):
 
     :param input: The input tensor.
     :param dims: The desired ordering of dimensions.  For example,
-        :code:`(2, 1, 0)` reverses the order dims in a a 3D tensor.
+        :code:`(2, 1, 0)` reverses the order dims in a 3D tensor.
 
     :code:`dims` can be passed as a tuple or as individual parameters: ::
 
@@ -1569,7 +1593,7 @@ def permute(input, *dims, _builder=None):
     :param input: The input tensor.
     :type input: Block
     :param dims: The desired ordering of dimensions.  For example,
-        :code:`(2, 1, 0)` reverses the order dims in a a 3D tensor.
+        :code:`(2, 1, 0)` reverses the order dims in a 3D tensor.
 
     :code:`dims` can be passed as a tuple or as individual parameters: ::
 
@@ -1815,8 +1839,8 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
 
 
 @builtin
-def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, fast_math=False, out_dtype=float32,
-               _builder=None):
+def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, fast_math=False, lhs_k_pack=True,
+               rhs_k_pack=True, out_dtype=float32, _builder=None):
     """
     Returns the matrix product of two blocks in microscaling format.
 
@@ -1843,11 +1867,15 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
     :param rhs_format: format of the rhs tensor. Available formats: {:code:`e2m1`, :code:`e4m3`, :code:`e5m2`, :code:`bf16`, :code:`fp16`}.
     :type rhs_format: str
     :param acc: The accumulator tensor. If not None, the result is added to this tensor.
+    :param lhs_k_pack: If false, the lhs tensor is packed into uint8 along M dimension.
+    :type lhs_k_pack: bool, optional
+    :param rhs_k_pack: If false, the rhs tensor is packed into uint8 along N dimension.
+    :type rhs_k_pack: bool, optional
     """
     out_dtype = _constexpr_to_value(out_dtype)
     assert out_dtype == float32, "Only float32 is supported for out_dtype at the moment"
-    return semantic.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc, fast_math, out_dtype,
-                               _builder)
+    return semantic.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc, fast_math, lhs_k_pack,
+                               rhs_k_pack, out_dtype, _builder)
 
 
 # -----------------------
@@ -1892,8 +1920,9 @@ def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", c
     :type boundary_check: tuple of ints, optional
     :param padding_option: should be one of {"", "zero", "nan"}, the padding value to use while out of bounds. "" means an undefined value.
     :param cache_modifier: changes cache option in NVIDIA PTX
-    :type cache_modifier: str, optional, should be one of {"", "ca", "cg"}, where "ca" stands for
-        cache at all levels and "cg" stands for cache at global level (cache in L2 and below, not L1), see
+    :type cache_modifier: str, optional, should be one of {"", ".ca", ".cg", ".cv"}, where ".ca" stands for
+        cache at all levels, ".cg" stands for cache at global level (cache in L2 and below, not L1),
+        and ".cv" means don’t cache and fetch again. see
         `cache operator <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#cache-operators>`_ for more details.
     :param eviction_policy: changes eviction policy in NVIDIA PTX
     :type eviction_policy: str, optional
@@ -1916,35 +1945,16 @@ def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", c
 
 
 @builtin
-def _experimental_reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype, _builder=None) -> tensor_descriptor_base:
-    """
-    Reinterpret a generic pointer as a TMA-backed tensor descriptor object.
-    """
-    block_ty = block_type(_constexpr_to_value(dtype), block_shape)
-    return semantic.reinterpret_tensor_descriptor(desc_ptr, block_ty, _builder)
-
-
-@builtin
-def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, _builder=None):
-    """
-    Experimental feature to access TMA descriptors loads. This is an escape hatch to easily exercise TTGIR operations.
-    This will be removed in the future and shouldn't be used in production code.
-
-    This loads a tensor of data based on the descriptor and offsets.
-    """
-    desc = _experimental_reinterpret_tensor_descriptor(desc_pointer, shape, dtype, _builder=_builder)
+def load_tensor_descriptor(desc: tensor_descriptor_base, offsets: Sequence[constexpr | tensor],
+                           _builder=None) -> tensor:
+    """Load a block of data from a tensor descriptor."""
     return desc.load(offsets, _builder=_builder)
 
 
 @builtin
-def _experimental_descriptor_store(desc_pointer, value, offsets, _builder=None):
-    """
-    Experimental feature to access TMA descriptors stores. This is an escape hatch to easily exercise TTGIR operations.
-    This will be removed in the future and shouldn't be used in production code.
-
-    This stores a tensor of data based on the descriptor and offsets.
-    """
-    desc = _experimental_reinterpret_tensor_descriptor(desc_pointer, value.shape, value.dtype, _builder=_builder)
+def store_tensor_descriptor(desc: tensor_descriptor_base, offsets: Sequence[constexpr | tensor], value: tensor,
+                            _builder=None) -> tensor:
+    """Store a block of data to a tensor descriptor."""
     return desc.store(offsets, value, _builder=_builder)
 
 
@@ -2935,10 +2945,18 @@ class range:
     :param flatten: automatically flatten the loop nest starting at this loop to
         create a single flattened loop. The compiler will try to pipeline the
         flattened loop which can avoid stage stalling.
+    :param warp_specialize: Enable automatic warp specialization on the loop.
+        The compiler will attempt to partition memory, MMA, and vector
+        operations in the loop into separate async partitions. This will
+        increase the total number of warps required by the kernel.
+
+        Note that warp specialization is only supported on Blackwell GPUs and
+        only works on simple matmul loops. Support for arbitrary loops will be
+        expanded over time.
     """
 
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None,
-                 disallow_acc_multi_buffer=False, flatten=False):
+                 disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False):
         if step is None:
             self.step = constexpr(1)
         else:
@@ -2953,6 +2971,7 @@ class range:
         self.loop_unroll_factor = loop_unroll_factor
         self.disallow_acc_multi_buffer = disallow_acc_multi_buffer
         self.flatten = flatten
+        self.warp_specialize = warp_specialize
 
     def __iter__(self):
         raise RuntimeError("tl.range can only be used in @triton.jit'd functions")

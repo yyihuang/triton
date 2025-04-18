@@ -53,7 +53,7 @@ private:
   /// MFMA or WMMA.
   ///
   /// \returns value with packed loaded values or empty value if this local_load
-  /// is not supproted.
+  /// is not supported.
   Value lowerSharedToDotOperandMMA(
       triton::gpu::LocalLoadOp op, triton::gpu::LocalLoadOpAdaptor adaptor,
       const LLVMTypeConverter *typeConverter,
@@ -156,10 +156,12 @@ private:
                                   RankedTensorType dstTy) const {
     // Single rate MFMA insts:
     // fp16, bf16: mfma32x32x8, mfma16x16x16
+    // fp8, bf8: mfma32x32x16, mfma16x16x32
     // int8: mfma32x32x16, mfma16x16x32
     //
     // Double rate MFMA insts:
     // fp16, bf16: mfma32x32x16, mfma16x16x32
+    // fp8, bf8: mfma32x32x64, mfma16x16x128
     // i8: mfma32x32x32, mfma16x16x64
     //
     // Check that double-rate MFMA instructions are used whenever possible.
@@ -178,8 +180,15 @@ private:
     const int kFactor = 16 / bitwidth;
     const int kSizeSingleRateMfma32 = 8 * kFactor;
     const int kSizeSingleRateMfma16 = 16 * kFactor;
-    const int largeTileThreshold =
+    int largeTileThreshold =
         (mDim == 32) ? kSizeSingleRateMfma32 : kSizeSingleRateMfma16;
+
+    // For FP8, wider MFMA instructions (scaled MFMA) have a k-dimension
+    // that is four times of regular MFMA instructions.
+    if (dstTy.getElementType().isFloat() && bitwidth == 8) {
+      largeTileThreshold *= 2;
+    }
+
     const auto shape = dstTy.getShape();
     const int kDim = dotEnc.getOpIdx() == 0 ? rank - 1 : rank - 2;
 
@@ -259,6 +268,7 @@ private:
           if (bitwidth == 16) {
             auto dsReadOp =
                 rewriter.create<ROCDL::ds_read_tr16_b64>(loc, vecTy, vecAddr);
+            LLVM::AMD::addLocalLoadNoAliasScope(op, dsReadOp);
             Value vecVal = dsReadOp.getResult();
             for (int v = 0; v < vecTy.getNumElements(); v++) {
               outVals.push_back(
@@ -272,6 +282,7 @@ private:
 
             auto dsReadOp =
                 rewriter.create<ROCDL::ds_read_tr8_b64>(loc, i32VecTy, vecAddr);
+            LLVM::AMD::addLocalLoadNoAliasScope(op, dsReadOp);
             Value vecVal = dsReadOp.getResult();
             for (auto i = 0; i < numElemsI32; ++i) {
               elemsI32.push_back(

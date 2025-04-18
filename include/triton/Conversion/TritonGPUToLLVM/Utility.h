@@ -53,9 +53,6 @@ createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
                           TypeRange types, ValueRange args);
 } // namespace mlir::LLVM
 
-// Is v an integer or floating-point scalar constant equal to 0?
-bool isConstantZero(Value v);
-
 namespace mlir::triton {
 
 struct TritonLLVMOpBuilder {
@@ -348,9 +345,6 @@ LLVM::LLVMFuncOp appendOrGetExternFuncOp(RewriterBase &rewriter, Operation *op,
 namespace LLVM {
 using namespace mlir::triton;
 
-// Is v an integer or floating-point scalar constant equal to 0?
-bool isConstantZero(Value v);
-
 class SharedMemoryObject {
 public:
   SharedMemoryObject(Value base, Type baseElemType, ArrayRef<Value> offsets)
@@ -515,6 +509,7 @@ inline Value getStackPointer(RewriterBase &rewriter,
 }
 
 inline Value getGlobalScratchPtr(Location loc, RewriterBase &rewriter,
+                                 const TargetInfoBase &targetInfo,
                                  FunctionOpInterface funcOp,
                                  Value allocOffset = {}) {
   // See NOTE: [Additional Function Arguments]
@@ -553,6 +548,11 @@ inline Value getGlobalScratchPtr(Location loc, RewriterBase &rewriter,
   Value linearId = gridIdx[2];
   for (int k = 0; k < 2; ++k) {
     linearId = b.add(gridIdx[1 - k], b.mul(linearId, gridDim[1 - k]));
+  }
+  auto numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  if (numCTAs > 1) {
+    linearId = b.mul(linearId, b.i32_val(numCTAs));
+    linearId = b.add(linearId, targetInfo.getClusterCTAId(rewriter, loc));
   }
 
   auto allocSize = allocSizeAttr.getValue().getZExtValue();
@@ -706,8 +706,7 @@ emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
     Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
     std::function<void(VectorType, Value /*shmemAddr*/)> perVectorCallback);
 
-SmallVector<Value> loadSharedToDistributed(RankedTensorType dstTy,
-                                           triton::gpu::MemDescType srcTy,
+SmallVector<Value> loadSharedToDistributed(triton::gpu::LocalLoadOp localLoadOp,
                                            Type elemLlvmTy,
                                            const SharedMemoryObject &smemObj,
                                            Location loc, RewriterBase &rewriter,
@@ -847,6 +846,10 @@ inline llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type) {
 inline bool isCanonicalIndex(unsigned index, unsigned freeVarMask) {
   return (index & freeVarMask) == 0;
 }
+
+// Certain lowerings may introduce references to function arguments. Keep warp
+// group code isolated from above by invoking this function.
+void makeAllWarpGroupsIsolatedFromAbove(Operation *op);
 
 } // namespace mlir
 
